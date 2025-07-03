@@ -13,16 +13,16 @@ stand_up_joint_pos = np.array([
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # L leg
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # R leg
     0.0, 0.0, 0.0,                   # Waist
-    0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # L arm
-    0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # R arm
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # L arm
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # R arm
 ])
 
 stand_down_joint_pos = np.array([
-    -0.3, 0.2, 0.0, 0.5, -0.2, 0.0,
-    -0.3, -0.2, 0.0, 0.5, -0.2, 0.0,
-    0.0, 0.0, 0.0,
-    0.0, -0.3, 0.0, 0.2, 0.0, 0.0, 0.0,
-    0.0, 0.3, 0.0, 0.2, 0.0, 0.0, 0.0
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # L leg
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,     # R leg
+    0.0, 0.0, 0.0,                   # Waist
+    -2.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # L arm
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # R arm
 ])
 
 dt = 0.002  # 500 Hz
@@ -44,27 +44,27 @@ if __name__ == '__main__':
         cmd.motor_cmd[i].mode = 0x0A  # Position control with PD and torque feedforward
 
     running_time = 0.0
-    cycle_duration = 6.0  # total cycle duration (3s up, 3s down)
+    cycle_duration = 8.0  # total cycle duration (3s up, 3s down)
 
     while True:
         step_start = time.perf_counter()
         t_mod = running_time % cycle_duration
 
-        if t_mod < 3.0:
-            # Stand up phase
-            phase = np.tanh(t_mod / 3.0)
+        half_cycle = cycle_duration / 2.0
+        if t_mod < half_cycle:
+            phase = 0.5 * (1 - np.cos(np.pi * t_mod / half_cycle))
             from_pose = stand_down_joint_pos
             to_pose = stand_up_joint_pos
         else:
-            # Squat down phase
-            phase = np.tanh((t_mod - 3.0) / 3.0)
+            phase = 0.5 * (1 - np.cos(np.pi * (t_mod - half_cycle) / half_cycle))
             from_pose = stand_up_joint_pos
             to_pose = stand_down_joint_pos
 
+
         for i in range(29):
             cmd.motor_cmd[i].q = (1 - phase) * from_pose[i] + phase * to_pose[i]
-            cmd.motor_cmd[i].kp = 30.0
-            cmd.motor_cmd[i].kd = 3.5
+            cmd.motor_cmd[i].kp = 5.0
+            cmd.motor_cmd[i].kd = 0.2
             cmd.motor_cmd[i].dq = 0.0
             cmd.motor_cmd[i].tau = 0.0
 
