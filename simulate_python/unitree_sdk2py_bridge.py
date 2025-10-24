@@ -48,7 +48,20 @@ NUM_MOTOR_IDL_GO = 20
 NUM_MOTOR_IDL_HG = 35
 
 class UnitreeSdk2Bridge:
-
+    def _build_hand_maps(self, names):
+        """Create actuator→joint maps so we can read q/qd from the right DOF."""
+        maps = []
+        for n in names:
+            aid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
+            if aid < 0:
+                maps.append(None); continue
+            jnt_id = int(self.mj_model.actuator_trnid[aid, 0])
+            if jnt_id < 0:
+                maps.append(None); continue
+            qadr = int(self.mj_model.jnt_qposadr[jnt_id])
+            dadr = int(self.mj_model.jnt_dofadr[jnt_id])
+            maps.append({"aid": aid, "qadr": qadr, "dadr": dadr})
+        return maps
     def __init__(self, mj_model, mj_data):
         self.mj_model = mj_model
         self.mj_data = mj_data
@@ -108,22 +121,18 @@ class UnitreeSdk2Bridge:
         # Precompute actuator IDs by name to avoid index assumptions
         self.left_hand_names = [
             "left_hand_thumb_0", "left_hand_thumb_1", "left_hand_thumb_2",
-            "left_hand_index_0", "left_hand_index_1",
             "left_hand_middle_0", "left_hand_middle_1",
+            "left_hand_index_0", "left_hand_index_1",
+            
         ]
         self.right_hand_names = [
             "right_hand_thumb_0", "right_hand_thumb_1", "right_hand_thumb_2",
-            "right_hand_index_0", "right_hand_index_1",
             "right_hand_middle_0", "right_hand_middle_1",
+            "right_hand_index_0", "right_hand_index_1",
         ]
-        self.left_hand_ids = [
-            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
-            for n in self.left_hand_names
-        ]
-        self.right_hand_ids = [
-            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
-            for n in self.right_hand_names
-        ]
+
+        self.left_map  = self._build_hand_maps(self.left_hand_names)
+        self.right_map = self._build_hand_maps(self.right_hand_names)
 
         # Subscribe to a few possible left/right topics (any that are wrong just won't deliver)
         self.dex_left_subs = []
@@ -157,15 +166,26 @@ class UnitreeSdk2Bridge:
             "left": 15,
         }
 
-    # Helper: safe write of a 7-element command into ctrl[]
-    def _apply_hand(self, ids, q):
-        if q is None:
-            return
-        N = min(len(ids), len(q))
+        self.hand_kp = [12.0]*7
+        self.hand_kd = [0.6]*7
+
+    def _apply_hand_pd(self, amap, q_des):
+        if not q_des: return
+        N = min(len(amap), len(q_des))
         for i in range(N):
-            aid = ids[i]
-            if aid >= 0:
-                self.mj_data.ctrl[aid] = q[i]
+            entry = amap[i]
+            if not entry: continue
+            aid  = entry["aid"]
+            qadr = entry["qadr"]
+            dadr = entry["dadr"]
+            q  = float(self.mj_data.qpos[qadr])
+            dq = float(self.mj_data.qvel[dadr])
+            tau = self.hand_kp[i]*(q_des[i] - q) - self.hand_kd[i]*dq
+
+            lo, hi = self.mj_model.actuator_ctrlrange[aid]
+            if lo < hi:  # clamp to actuator ctrl range if defined
+                tau = max(lo, min(hi, tau))
+            self.mj_data.ctrl[aid] = tau
 
     def LowCmdHandler(self, msg: LowCmd_):
         try:
@@ -194,18 +214,15 @@ class UnitreeSdk2Bridge:
             return None
 
     def DexLeftHandler(self, msg: HandCmd_):
-        try:
-            q = self._extract_positions(msg)
-            self._apply_hand(self.left_hand_ids, q)
-        except Exception as e:
-            print("[DexLeftHandler] error:", e)
+        q = self._extract_positions(msg)
+        # print("[DexLeft] q:", q)
+        self._apply_hand_pd(self.left_map, q)
+        print("[Dex map] L:", self.left_map)
 
     def DexRightHandler(self, msg: HandCmd_):
-        try:
-            q = self._extract_positions(msg)
-            self._apply_hand(self.right_hand_ids, q)
-        except Exception as e:
-            print("[DexRightHandler] error:", e)
+        q = self._extract_positions(msg)
+        self._apply_hand_pd(self.right_map, q)
+
 
     def PublishLowState(self):
         try:
