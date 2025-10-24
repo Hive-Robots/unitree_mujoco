@@ -18,6 +18,8 @@ if config.ROBOT=="g1":
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
     # Dex hand command (7 joints) for G1/H1
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+    from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandState_ as HandState_default
     from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_ as LowState_default
 else:
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_
@@ -134,6 +136,35 @@ class UnitreeSdk2Bridge:
         self.left_map  = self._build_hand_maps(self.left_hand_names)
         self.right_map = self._build_hand_maps(self.right_hand_names)
 
+        self.left_hand_ids  = [m["aid"] if m else -1 for m in self.left_map]
+        self.right_hand_ids = [m["aid"] if m else -1 for m in self.right_map]
+
+        self.hand_aids = set(aid for aid in (self.left_hand_ids + self.right_hand_ids) if aid >= 0)
+
+        self.hand_kp = [12.0]*7
+        self.hand_kd = [0.6]*7
+
+        self.hand_state_L = HandState_default()
+        self.hand_state_R = HandState_default()
+
+        # publish to both common namespaces
+        self.dex_L_state_publishers = [
+            ChannelPublisher("rt/dex3/left/state",  HandState_),
+            ChannelPublisher("rt/lf/dex3/left/state",  HandState_),
+        ]
+        self.dex_R_state_publishers = [
+            ChannelPublisher("rt/dex3/right/state", HandState_),
+            ChannelPublisher("rt/lf/dex3/right/state", HandState_),
+        ]
+        for p in self.dex_L_state_publishers + self.dex_R_state_publishers:
+            p.Init()
+
+        # start a thread that publishes q/dq/τ for 7 joints per side
+        self.HandStateThread = RecurrentThread(
+            interval=self.dt, target=self.PublishHandState, name="sim_handstate"
+        )
+        self.HandStateThread.Start()
+
         # Subscribe to a few possible left/right topics (any that are wrong just won't deliver)
         self.dex_left_subs = []
         self.dex_right_subs = []
@@ -166,8 +197,6 @@ class UnitreeSdk2Bridge:
             "left": 15,
         }
 
-        self.hand_kp = [12.0]*7
-        self.hand_kd = [0.6]*7
 
     def _apply_hand_pd(self, amap, q_des):
         if not q_des: return
@@ -188,30 +217,91 @@ class UnitreeSdk2Bridge:
             self.mj_data.ctrl[aid] = tau
 
     def LowCmdHandler(self, msg: LowCmd_):
+        """Apply LowCmd to non-hand actuators with PD+feedforward; leave hands to Dex PD."""
         try:
             if self.mj_data is None:
                 return
-            # msg.motor_cmd length is IDL-limited (35 on HG)
-            N = min(self.num_motor, getattr(msg, "motor_cmd", []).__len__())
+
+            motor_cmd = getattr(msg, "motor_cmd", None)
+            if not motor_cmd:
+                return
+
+            N_idl = len(motor_cmd)                    # how many motors the IDL carries (e.g., 35 on HG)
+            N_sim = self.num_motor                    # how many actuators in the MuJoCo model
+            N = min(N_idl, N_sim)
+
+            # iterate only through actuators covered by the IDL
             for i in range(N):
-                self.mj_data.ctrl[i] = (
-                    msg.motor_cmd[i].tau
-                    + msg.motor_cmd[i].kp * (msg.motor_cmd[i].q  - self.mj_data.sensordata[i])
-                    + msg.motor_cmd[i].kd * (msg.motor_cmd[i].dq - self.mj_data.sensordata[i + self.num_motor])
-                )
-            # (optional) zero any extra sim actuators not covered by IDL
-            for i in range(N, self.num_motor):
-                # leave as-is, or explicitly:
-                # self.mj_data.ctrl[i] = 0.0
-                pass
-        except Exception as e:
-            import traceback; print("[LowCmdHandler] Exception:"); traceback.print_exc()
+                # skip hands — controlled elsewhere
+                if i in self.hand_aids:
+                    continue
+
+                cmd   = motor_cmd[i]
+                tauff = float(getattr(cmd, "tau", 0.0))
+                kp    = float(getattr(cmd, "kp", 0.0))
+                kd    = float(getattr(cmd, "kd", 0.0))
+                qdes  = float(getattr(cmd, "q",  self.mj_data.sensordata[i]))
+                dqdes = float(getattr(cmd, "dq", self.mj_data.sensordata[i + self.num_motor]))
+
+                q  = float(self.mj_data.sensordata[i])
+                dq = float(self.mj_data.sensordata[i + self.num_motor])
+
+                u = tauff + kp * (qdes - q) + kd * (dqdes - dq)
+
+                # clamp to actuator ctrl range if defined
+                lo, hi = self.mj_model.actuator_ctrlrange[i]
+                if lo < hi:
+                    if u < lo: u = lo
+                    elif u > hi: u = hi
+
+                self.mj_data.ctrl[i] = u
+
+            # For sim actuators beyond IDL length, zero them unless they are hands
+            for i in range(N, N_sim):
+                if i in self.hand_aids:
+                    continue
+                self.mj_data.ctrl[i] = 0.0
+
+        except Exception:
+            import traceback
+            print("[LowCmdHandler] Exception:")
+            traceback.print_exc()
+
 
     def _extract_positions(self, msg: HandCmd_):
         try:
             return [msg.motor_cmd[i].q for i in range(7)]
         except Exception:
             return None
+    
+    def _fill_hand_state_from_map(self, amap, hs: HandState_):
+        for i in range(min(7, len(amap))):
+            entry = amap[i]
+            if not entry:
+                hs.motor_state[i].q = 0.0
+                hs.motor_state[i].dq = 0.0
+                hs.motor_state[i].tau_est = 0.0
+                continue
+            aid  = entry["aid"]
+            # motor sensors are ordered per actuator index: pos, vel, tau blocks
+            q   = float(self.mj_data.sensordata[aid])
+            dq  = float(self.mj_data.sensordata[aid + self.num_motor])
+            tau = float(self.mj_data.sensordata[aid + 2 * self.num_motor])
+            hs.motor_state[i].q = q
+            hs.motor_state[i].dq = dq
+            hs.motor_state[i].tau_est = tau
+
+
+    def PublishHandState(self):
+        if self.mj_data is None:
+            return
+        self._fill_hand_state_from_map(self.left_map, self.hand_state_L)
+        for p in self.dex_L_state_publishers:
+            p.Write(self.hand_state_L)
+
+        self._fill_hand_state_from_map(self.right_map, self.hand_state_R)
+        for p in self.dex_R_state_publishers:
+            p.Write(self.hand_state_R)
 
     def DexLeftHandler(self, msg: HandCmd_):
         q = self._extract_positions(msg)
