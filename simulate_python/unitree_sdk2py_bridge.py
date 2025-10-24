@@ -141,9 +141,6 @@ class UnitreeSdk2Bridge:
 
         self.hand_aids = set(aid for aid in (self.left_hand_ids + self.right_hand_ids) if aid >= 0)
 
-        self.hand_kp = [12.0]*7
-        self.hand_kd = [0.6]*7
-
         self.hand_state_L = HandState_default()
         self.hand_state_R = HandState_default()
 
@@ -198,23 +195,47 @@ class UnitreeSdk2Bridge:
         }
 
 
-    def _apply_hand_pd(self, amap, q_des):
-        if not q_des: return
-        N = min(len(amap), len(q_des))
+    def _apply_hand_from_msg(self, amap, msg):
+        # expects HandCmd_ (7 motors) and a map from _build_hand_maps(...)
+        # --- Debug: print kp, kd, q, dq once to confirm Dex3 C++ sends them ---
+        if not hasattr(self, "_printed_hand_debug"):
+            m = msg.motor_cmd
+            print("[Dex3 DEBUG] kp:",  [float(x.kp) for x in m[:7]])
+            print("[Dex3 DEBUG] kd:",  [float(x.kd) for x in m[:7]])
+            print("[Dex3 DEBUG] q :",  [float(x.q ) for x in m[:7]])
+            print("[Dex3 DEBUG] dq:",  [float(x.dq) for x in m[:7]])
+            print("[Dex3 DEBUG] tau:", [float(x.tau) for x in m[:7]])
+            self._printed_hand_debug = True
+        # ---------------------------------------------------------------
+        motors = getattr(msg, "motor_cmd", [])
+        N = min(7, len(motors), len(amap))
         for i in range(N):
             entry = amap[i]
-            if not entry: continue
+            if not entry:
+                continue
             aid  = entry["aid"]
             qadr = entry["qadr"]
             dadr = entry["dadr"]
+
+            cmd  = motors[i]
+            tau_ff = float(getattr(cmd, "tau", 0.0))
+            kp    = float(getattr(cmd, "kp", 0.0))
+            kd    = float(getattr(cmd, "kd", 0.0))
+            qdes  = float(getattr(cmd, "q",  self.mj_data.qpos[qadr]))
+            dqdes = float(getattr(cmd, "dq", 0.0))
+
             q  = float(self.mj_data.qpos[qadr])
             dq = float(self.mj_data.qvel[dadr])
-            tau = self.hand_kp[i]*(q_des[i] - q) - self.hand_kd[i]*dq
+
+            u = tau_ff + kp*(qdes - q) + kd*(dqdes - dq)
 
             lo, hi = self.mj_model.actuator_ctrlrange[aid]
-            if lo < hi:  # clamp to actuator ctrl range if defined
-                tau = max(lo, min(hi, tau))
-            self.mj_data.ctrl[aid] = tau
+            if lo < hi:
+                if u < lo: u = lo
+                elif u > hi: u = hi
+
+            self.mj_data.ctrl[aid] = u
+
 
     def LowCmdHandler(self, msg: LowCmd_):
         """Apply LowCmd to non-hand actuators with PD+feedforward; leave hands to Dex PD."""
@@ -304,14 +325,10 @@ class UnitreeSdk2Bridge:
             p.Write(self.hand_state_R)
 
     def DexLeftHandler(self, msg: HandCmd_):
-        q = self._extract_positions(msg)
-        # print("[DexLeft] q:", q)
-        self._apply_hand_pd(self.left_map, q)
-        print("[Dex map] L:", self.left_map)
+        self._apply_hand_from_msg(self.left_map, msg)
 
     def DexRightHandler(self, msg: HandCmd_):
-        q = self._extract_positions(msg)
-        self._apply_hand_pd(self.right_map, q)
+        self._apply_hand_from_msg(self.right_map, msg)
 
 
     def PublishLowState(self):
